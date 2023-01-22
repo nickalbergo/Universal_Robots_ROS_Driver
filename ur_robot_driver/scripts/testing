@@ -1,0 +1,868 @@
+#!/usr/bin/env python
+
+# Nick Albergo
+# code is all over the place, will need to refactor and move things around eventually
+
+import sys
+import math
+import time
+import inspect
+import numpy as np
+from scipy.spatial.transform import Rotation
+import rospy
+import geometry_msgs.msg
+import tf2_ros
+import actionlib
+import robotiq_gripper
+from control_msgs.msg import FollowJointTrajectoryAction, FollowJointTrajectoryGoal
+from trajectory_msgs.msg import JointTrajectoryPoint
+from controller_manager_msgs.srv import SwitchControllerRequest, SwitchController
+from controller_manager_msgs.srv import LoadControllerRequest, LoadController
+from controller_manager_msgs.srv import ListControllers, ListControllersRequest
+import geometry_msgs.msg as geometry_msgs
+import sensor_msgs.msg as sensor_msgs
+from cartesian_control_msgs.msg import (
+    FollowCartesianTrajectoryAction,
+    FollowCartesianTrajectoryGoal,
+    CartesianTrajectoryPoint,
+)
+
+# Compatibility for python2 and python3
+if sys.version_info[0] < 3:
+    input = raw_input
+
+# ur joint names
+JOINT_NAMES = [
+    "shoulder_pan_joint",
+    "shoulder_lift_joint",
+    "elbow_joint",
+    "wrist_1_joint",
+    "wrist_2_joint",
+    "wrist_3_joint",
+]
+
+# ur joint-based controllers
+JOINT_TRAJECTORY_CONTROLLERS = [
+    "scaled_pos_joint_traj_controller",
+    "scaled_vel_joint_traj_controller",
+    "pos_joint_traj_controller",
+    "vel_joint_traj_controller",
+    "forward_joint_traj_controller",
+]
+
+# ur cartesian-based controllers
+CARTESIAN_TRAJECTORY_CONTROLLERS = [
+    "pose_based_cartesian_traj_controller",
+    "joint_based_cartesian_traj_controller",
+    "forward_cartesian_traj_controller",
+]
+
+# We'll have to make sure that none of these controllers are running, as they will
+# be conflicting with the joint trajectory controllers
+CONFLICTING_CONTROLLERS = ["joint_group_vel_controller", "twist_controller"]
+
+### GLOBALS
+
+# robot ip (to communicate with gripper)
+ip = "192.168.10.83"
+
+# angle UR is mounted at
+mount_angle = -(3*math.pi)/4
+
+# rotational matrix, set when calling get_rotation_matrix function
+rotation_matrix =   [[1, 0, 0],
+                     [0, 1, 0],
+                     [0, 0, 1]]
+
+# current joint orientation
+joints_pos = []
+
+# why are these flipped at all? insane
+# convert from ROS to pendant
+def print_joints_ordered():
+    print("BASE: " +  str(math.degrees(joints_pos[2])))
+    print("SHOULDER: " + str(math.degrees(joints_pos[1])))
+    print("ELBOW: " + str(math.degrees(joints_pos[0])))
+    print("WRIST_1: " + str(math.degrees(joints_pos[3])))
+    print("WRIST_2: " + str(math.degrees(joints_pos[4])))
+    print("WRIST_3: " + str(math.degrees(joints_pos[5])))
+
+### LINEAR TRANSFORMATION HELPER FUNCTIONS
+# returns rotational matrix around y axis
+def get_y_rotation_matrix(angle):
+    global rotation_matrix
+
+    cos_t = math.cos(angle)
+    sin_t = math.sin(angle)
+
+    rotation_matrix  =  [[cos_t,  0,  sin_t],
+                         [0,      1,      0],
+                         [-sin_t, 0,  cos_t]]
+
+# apply tfm linear transform to coords and return dot product
+def apply_linear_transformation(coords, tfm):
+    return np.dot(tfm, coords)
+
+### JOINT CALLBACK
+# obtain joints and store in global
+# TODO: I HAVE ABSOLUTELY NO IDEA WHY THE BASE AND ELBOW ARE FLIPPED
+def joint_callback(msg):
+    global joints_pos
+    joints_pos = [msg.position[2], msg.position[1], msg.position[0], msg.position[3], msg.position[4], msg.position[5]] 
+
+class TrajectoryClient:
+    """Small trajectory client to test a joint trajectory"""
+
+    def __init__(self):
+        rospy.init_node("test_move")
+
+        timeout = rospy.Duration(5)
+        self.switch_srv = rospy.ServiceProxy(
+            "controller_manager/switch_controller", SwitchController
+        )
+        self.load_srv = rospy.ServiceProxy("controller_manager/load_controller", LoadController)
+        self.list_srv = rospy.ServiceProxy("controller_manager/list_controllers", ListControllers)
+        try:
+            self.switch_srv.wait_for_service(timeout.to_sec())
+        except rospy.exceptions.ROSException as err:
+            rospy.logerr("Could not reach controller switch service. Msg: {}".format(err))
+            sys.exit(-1)
+
+        self.joint_trajectory_controller = JOINT_TRAJECTORY_CONTROLLERS[0]
+        self.cartesian_trajectory_controller = CARTESIAN_TRAJECTORY_CONTROLLERS[2]
+
+        # tf listener
+        self.tfBuffer = tf2_ros.Buffer()
+        self.listener = tf2_ros.TransformListener(self.tfBuffer)
+        self.rate = rospy.Rate(10.0)
+
+        # joint listener
+        rospy.Subscriber("joint_states", sensor_msgs.JointState, joint_callback)
+
+        # init gripper
+        self.gripper = robotiq_gripper.RobotiqGripper()
+        self.gripper.connect(ip, 63352)
+        # for calibration, takes awhile so ignore for now
+        # self.gripper.activate()
+
+    # target should be (for now) list of 6 desired joint angles
+    # time is how long to take for execution
+    # relative is a boolean whether or not we want to use relative movement
+    def send_joint_trajectory(self, target, time, relative):
+        """Creates a trajectory and sends it using the selected action server"""
+
+        # make sure the correct controller is loaded and activated
+        self.switch_controller(self.joint_trajectory_controller)
+        
+        trajectory_client = actionlib.SimpleActionClient(
+            "{}/follow_joint_trajectory".format(self.joint_trajectory_controller),
+            FollowJointTrajectoryAction,
+        )
+
+        # Wait for action server to be ready
+        timeout = rospy.Duration(5)
+        if not trajectory_client.wait_for_server(timeout):
+            rospy.logerr("Could not reach controller action server.")
+            sys.exit(-1)
+
+        # Create and fill trajectory goal
+        goal = FollowJointTrajectoryGoal()
+        goal.trajectory.joint_names = JOINT_NAMES
+
+        # The following list are arbitrary positions
+        # Change to your own needs if desired
+        #position_list = [[1.5708282629596155, -0.7853917640498658, 1.5707833766937256, -2.3561765156187953, 0.7854188084602356, 0]]
+        #position_list.append([1.5708282629596155, -0.7853917640498658, 1.5707833766937256, -2.3561765156187953, 0.7854188084602356, 0.75])
+        #position_list.append([1.5708282629596155, -0.7853917640498658, 1.5707833766937256, -2.3561765156187953, 0.7854188084602356, 1.55])
+        
+        if (relative):
+            position_list = [sum(x) for x in zip(joints_pos, target)]
+        else:
+            position_list = target
+
+        # duration_list = [3.0]
+        # for i, position in enumerate(position_list):
+        #     point = JointTrajectoryPoint()
+        #     point.positions = position
+        #     point.time_from_start = rospy.Duration(duration_list[i])
+        #     goal.trajectory.points.append(point)
+
+        point = JointTrajectoryPoint()
+        point.positions = position_list
+        point.time_from_start = rospy.Duration(time)
+        goal.trajectory.points.append(point)
+
+        trajectory_client.send_goal(goal)
+        trajectory_client.wait_for_result()
+
+        result = trajectory_client.get_result()
+
+    def send_joint_trajectory_list(self, targets, times, relative):
+        """Creates a trajectory and sends it using the selected action server"""
+
+        # make sure the correct controller is loaded and activated
+        self.switch_controller(self.joint_trajectory_controller)
+        
+        trajectory_client = actionlib.SimpleActionClient(
+            "{}/follow_joint_trajectory".format(self.joint_trajectory_controller),
+            FollowJointTrajectoryAction,
+        )
+
+        # Wait for action server to be ready
+        timeout = rospy.Duration(5)
+        if not trajectory_client.wait_for_server(timeout):
+            rospy.logerr("Could not reach controller action server.")
+            sys.exit(-1)
+
+        # Create and fill trajectory goal
+        goal = FollowJointTrajectoryGoal()
+        goal.trajectory.joint_names = JOINT_NAMES
+
+        # The following list are arbitrary positions
+        # Change to your own needs if desired
+        #position_list = [[1.5708282629596155, -0.7853917640498658, 1.5707833766937256, -2.3561765156187953, 0.7854188084602356, 0]]
+        #position_list.append([1.5708282629596155, -0.7853917640498658, 1.5707833766937256, -2.3561765156187953, 0.7854188084602356, 0.75])
+        #position_list.append([1.5708282629596155, -0.7853917640498658, 1.5707833766937256, -2.3561765156187953, 0.7854188084602356, 1.55])
+        # print("BEFORE")
+        # print_joints_ordered()
+        
+        position_list = []
+        if (relative):
+            position_list.append([sum(x) for x in zip(joints_pos, targets[0])])
+            
+            if (len(targets) > 1):
+                for x, target in enumerate(targets[1:]):
+                    update = [sum(x) for x in zip(position_list[x], target)]
+                    position_list = np.vstack([position_list, update])
+        else:
+            position_list = targets[0]
+            if (len(targets) > 1):
+                for target in targets[1:]:
+                    position_list.append(target)
+
+        duration_list = times
+        for i, position in enumerate(position_list):
+            point = JointTrajectoryPoint()
+            point.positions = position
+            point.time_from_start = rospy.Duration(duration_list[i])
+            goal.trajectory.points.append(point)
+
+        # point = JointTrajectoryPoint()
+        # point.positions = position_list
+        # point.time_from_start = rospy.Duration(time)
+        # goal.trajectory.points.append(point)
+
+        trajectory_client.send_goal(goal)
+        trajectory_client.wait_for_result()
+
+        result = trajectory_client.get_result()
+
+    def set_joint(self, index, angle, time):
+        target = joints_pos
+        target[index] = angle
+        self.send_joint_trajectory(target, time, False)
+
+    # target should be (for now) x, y, and z coord list to goal position
+    # time is how long to take for execution
+    # relative is a boolean whether or not we want to use relative movement (unused here, always relative for now)
+    # qtn is angle (quaternion), default is whatever the current rotation is
+    def send_cartesian_trajectory(self, target, time, relative, qtn = [-1,-1,-1,-1]):
+        """Creates a Cartesian trajectory and sends it using the selected action server"""
+        self.switch_controller(self.cartesian_trajectory_controller)
+
+        # make sure the correct controller is loaded and activated
+        goal = FollowCartesianTrajectoryGoal()
+        trajectory_client = actionlib.SimpleActionClient(
+            "{}/follow_cartesian_trajectory".format(self.cartesian_trajectory_controller),
+            FollowCartesianTrajectoryAction,
+        )
+
+        # Wait for action server to be ready
+        timeout = rospy.Duration(5)
+        if not trajectory_client.wait_for_server(timeout):
+            rospy.logerr("Could not reach controller action server.")
+            sys.exit(-1)
+
+        # rotate basis to get actual relative cartesian movement
+        transformed_target = apply_linear_transformation(target, rotation_matrix)
+
+        # get current position and orientation (quaternion)
+        transform = self.tfBuffer.lookup_transform('base', 'tool0_controller', rospy.Time(), rospy.Duration(1))
+
+        # this feels really gross - checks if default or quaternion is provided
+        if (sum(qtn) == -4):
+            qn = [transform.transform.rotation.x, transform.transform.rotation.y, transform.transform.rotation.z, transform.transform.rotation.w]
+        else:
+            qn = qtn
+
+        pos = [transform.transform.translation.x, transform.transform.translation.y, transform.transform.translation.z]
+
+        transformed_target = [sum(x) for x in zip(transformed_target, pos)]
+
+        #pose_list = [geometry_msgs.Pose(geometry_msgs.Vector3(transformed), geometry_msgs.Quaternion(0, 0.38456, 0, 0.92))]
+        pose_list = [geometry_msgs.Pose(geometry_msgs.Vector3(transformed_target[0], transformed_target[1], transformed_target[2]), geometry_msgs.Quaternion(qn[0], qn[1], qn[2], qn[3]))]
+
+        duration_list = [time]
+
+        for i, pose in enumerate(pose_list):
+            point = CartesianTrajectoryPoint()
+            point.pose = pose
+            point.time_from_start = rospy.Duration(duration_list[i])
+            goal.trajectory.points.append(point)
+
+        trajectory_client.send_goal(goal)
+        trajectory_client.wait_for_result()
+
+        result = trajectory_client.get_result()
+
+    ###############################################################################################
+    #                                                                                             #
+    # Methods defined below are for the sake of safety / flexibility of this demo script only.    #
+    # If you just want to copy the relevant parts to make your own motion script you don't have   #
+    # to use / copy all the functions below.                                                       #
+    #                                                                                             #
+    ###############################################################################################
+
+    def ask_confirmation(self, waypoint_list):
+        """Ask the user for confirmation. This function is obviously not necessary, but makes sense
+        in a testing script when you know nothing about the user's setup."""
+        rospy.logwarn("The robot will move to the following waypoints: \n{}".format(waypoint_list))
+        confirmed = False
+        valid = False
+        while not valid:
+            input_str = input(
+                "Please confirm that the robot path is clear of obstacles.\n"
+                "Keep the EM-Stop available at all times. You are executing\n"
+                "the motion at your own risk. Please type 'y' to proceed or 'n' to abort: "
+            )
+            valid = input_str in ["y", "n"]
+            if not valid:
+                rospy.loginfo("Please confirm by entering 'y' or abort by entering 'n'")
+            else:
+                confirmed = input_str == "y"
+        if not confirmed:
+            rospy.loginfo("Exiting as requested by user.")
+            sys.exit(0)
+
+    def choose_controller(self):
+        """Ask the user to select the desired controller from the available list."""
+        rospy.loginfo("Available trajectory controllers:")
+        for (index, name) in enumerate(JOINT_TRAJECTORY_CONTROLLERS):
+            rospy.loginfo("{} (joint-based): {}".format(index, name))
+        for (index, name) in enumerate(CARTESIAN_TRAJECTORY_CONTROLLERS):
+            rospy.loginfo("{} (Cartesian): {}".format(index + len(JOINT_TRAJECTORY_CONTROLLERS), name))
+        choice = -1
+        while choice < 0:
+            input_str = input(
+                "Please choose a controller by entering its number (Enter '0' if "
+                "you are unsure / don't care): "
+            )
+            try:
+                choice = int(input_str)
+                if choice < 0 or choice >= len(JOINT_TRAJECTORY_CONTROLLERS) + len(
+                    CARTESIAN_TRAJECTORY_CONTROLLERS
+                ):
+                    rospy.loginfo(
+                        "{} not inside the list of options. "
+                        "Please enter a valid index from the list above.".format(choice)
+                    )
+                    choice = -1
+            except ValueError:
+                rospy.loginfo("Input is not a valid number. Please try again.")
+        if choice < len(JOINT_TRAJECTORY_CONTROLLERS):
+            self.joint_trajectory_controller = JOINT_TRAJECTORY_CONTROLLERS[choice]
+            return "joint_based"
+
+        self.cartesian_trajectory_controller = CARTESIAN_TRAJECTORY_CONTROLLERS[
+            choice - len(JOINT_TRAJECTORY_CONTROLLERS)
+        ]
+        return "cartesian"
+
+    def switch_controller(self, target_controller):
+        """Activates the desired controller and stops all others from the predefined list above"""
+        other_controllers = (
+            JOINT_TRAJECTORY_CONTROLLERS
+            + CARTESIAN_TRAJECTORY_CONTROLLERS
+            + CONFLICTING_CONTROLLERS
+        )
+
+        other_controllers.remove(target_controller)
+
+        srv = ListControllersRequest()
+        response = self.list_srv(srv)
+        for controller in response.controller:
+            if controller.name == target_controller and controller.state == "running":
+                return
+
+        srv = LoadControllerRequest()
+        srv.name = target_controller
+        self.load_srv(srv)
+
+        srv = SwitchControllerRequest()
+        srv.stop_controllers = other_controllers
+        srv.start_controllers = [target_controller]
+        srv.strictness = SwitchControllerRequest.BEST_EFFORT
+        self.switch_srv(srv)
+
+    # ### DEBUGGING, MOVEMENT, ETC.
+    # # face positive y
+    # def look_at_me(self):
+    #     self.send_joint_trajectory([math.pi/2, -math.pi/4, math.pi/2, (-3*math.pi)/4, (3*math.pi)/4, math.pi/2], 1, False)
+
+    # # face negative y
+    # def look_away(self):
+    #     self.send_joint_trajectory([math.pi/2, -math.pi/4, math.pi/2, (-3*math.pi)/4, -(math.pi)/4, -math.pi/2], 1, False)
+
+    # # home (just an alias for now)
+    # def home(self):
+    #     self.look_at_me()
+
+    # # rotate end effector
+    # # TODO: calibrate with camera on robot
+    # def rotate(self, angles):
+    #     transform = self.tfBuffer.lookup_transform('base', 'tool0_controller', rospy.Time(), rospy.Duration(1))
+    #     qn = [transform.transform.rotation.x, transform.transform.rotation.y, transform.transform.rotation.z, transform.transform.rotation.w]
+    #     #pos = [transform.transform.translation.x, transform.transform.translation.y, transform.transform.translation.z]
+
+    #     rq = Rotation.from_quat(qn)
+    #     re = rq.as_euler('xyz', degrees=True)
+    #     re = [sum(x) for x in zip(re, angles)]
+    #     rq = Rotation.from_euler('xyz', re, degrees=True)
+
+    #     self.send_cartesian_trajectory([0,0,0], 3, True, rq.as_quat())
+
+    ### KINEMES
+    # open comms, execute each kineme in commands list + dummy in between, close comms
+    # commands is list of kinemes
+    # args is optional list of arguments if kinemes included need them, whenever kineme
+    # requires an argument it will grab next arg from args
+
+    # kineme: open/close gripper 3 times
+    # intent: begin/end transmission
+
+    # TODO: remove duplicate
+    def dummy_home(self):
+        self.send_joint_trajectory([math.pi/2, -math.pi/4, math.pi/2, (-3*math.pi)/4, (3*math.pi)/4, math.pi/2], 1, False)
+
+
+
+    def toggle_communication(self):
+        for _ in range(0, 2):
+            self.gripper.pinch()
+
+    def execute(self, commands, homing=True, dummy=False):
+        # wait for joint subscriber to get joint values
+        while (not joints_pos):
+            rospy.sleep(1)
+
+        if (homing):
+            self.dummy_home()
+
+        # signal start of transmission (disabled because this takes forever)
+        if (dummy):
+            self.toggle_communication()
+
+        for c in commands:
+            print("Executing command: " + str(c.name) + "; args = " + str(c.args))
+            # get function information (this would be so much less awkward for me in C or C++)
+            #f_info = inspect.getfullargspec(c)
+
+            # how many non-self args
+            #args_to_pass = len(f_info.args) - 1
+
+            # could do a while but don't want to think about it right now so just handle 1 arg
+            # also assuming args is a list of lists which I think is ok for now
+            # TODO: handle exceptions
+            c.call()
+
+            if (dummy):
+                self.gripper.pinch()
+            
+            # TODO: WAIT FOR PREVIOUS TRAJECTORY, fix this
+            rospy.sleep(1.5)
+
+        if (homing):
+            self.dummy_home()
+
+        if (dummy):
+            self.toggle_communication()
+
+    # def execute(self, commands, *args):
+    #     # wait for joint subscriber to get joint values
+    #     while (not joints_pos):
+    #         rospy.sleep(1)
+
+    #     # signal start of transmission (disabled because this takes forever)
+    #     #self.toggle_communication()
+    #     current_arg = 0
+
+    #     for c in commands:
+    #         # get function information (this would be so much less awkward for me in C or C++)
+    #         f_info = inspect.getfullargspec(c)
+
+    #         # how many non-self args
+    #         args_to_pass = len(f_info.args) - 1
+
+    #         # could do a while but don't want to think about it right now so just handle 1 arg
+    #         # also assuming args is a list of lists which I think is ok for now
+    #         # TODO: handle exceptions
+    #         if (args_to_pass > 0):
+    #             c(args[0][current_arg])
+    #             current_arg += 1
+    #         else:
+    #             c()
+
+            # placeholder, maybe something better or no dummy at all ideally
+            #self.gripper.pinch()
+
+        #self.toggle_communication()
+
+    # # kineme: open/close gripper 3 times
+    # # intent: begin/end transmission
+    # def toggle_communication(self):
+    #     for x in range(0, 3):
+    #         self.gripper.pinch()
+
+    # # kineme: nod "head" (end effector)
+    # # doesn't work if we are near a singularity, I think
+    # # intent: ?
+    # # def nod(self):
+    # #     # check orientation so we always start nodding "up" first
+    # #     sign = 1
+    # #     if (joints_pos[4] <= math.pi/4):
+    # #         sign *= -1
+
+    # #     # TODO: check for singularities or something
+
+    # #     self.send_joint_trajectory([0, 0, 0, 0, sign * math.pi/6, 0], 0.5, True)
+    # #     self.send_joint_trajectory([0, 0, 0, 0, -sign * math.pi/3, 0], 0.5, True)
+    # #     self.send_joint_trajectory([0, 0, 0, 0, sign * math.pi/6, 0], 0.5, True)
+
+    # # kineme: rotate end effector 90 degrees and back
+    # # intent: grab nearest?
+    # def grab(self):
+    #     self.send_joint_trajectory([0, 0, 0, 0, 0, math.pi/2], 0.5, True)
+    #     self.send_joint_trajectory([0, 0, 0, 0, 0, -math.pi/2], 0.5, True)
+
+    # kineme: points end effector at target
+    # intent: designate location
+    # def point_at(self, coords):
+    #     # TODO: given 3D point p in space, align end effector s.t.
+    #     return
+
+        # its x vector intersects p
+        #self.send_cartesian_trajectory(coords, 2, True)
+        # if (coords[0] != 0):
+        #     theta_z = math.tan(coords[1] / coords[0])
+        # else:
+        #     return
+        # if (coords[1] != 0):
+        #     theta_x = math.tan(coords[2] / coords[1])
+        # else:
+        #     return
+
+
+        # r = Rotation.from_euler('xyz', [theta_x, 0, theta_z], degrees=False)
+        # qr = r.as_quat()
+        # self.send_cartesian_trajectory([0,0,0], 2, True, qr)
+
+### DEBUGGING, MOVEMENT, ETC.
+# face positive y
+def look_at_me(client):
+    client.send_joint_trajectory([math.pi/2, -math.pi/4, math.pi/2, (-3*math.pi)/4, (3*math.pi)/4, math.pi/2], 1, False)
+
+# face negative y
+def look_away(client):
+    client.send_joint_trajectory([math.pi/2, -math.pi/4, math.pi/2, (-3*math.pi)/4, -(math.pi)/4, -math.pi/2], 1, False)
+
+# home (just an alias for now)
+def home(client):
+    look_at_me(client)
+
+# rotate end effector
+# TODO: calibrate with camera on robot (for pointing)
+def rotate(client, angles):
+    transform = client.tfBuffer.lookup_transform('base', 'tool0_controller', rospy.Time(), rospy.Duration(1))
+    qn = [transform.transform.rotation.x, transform.transform.rotation.y, transform.transform.rotation.z, transform.transform.rotation.w]
+    #pos = [transform.transform.translation.x, transform.transform.translation.y, transform.transform.translation.z]
+
+    rq = Rotation.from_quat(qn)
+    re = rq.as_euler('xyz', degrees=True)
+    re = [sum(x) for x in zip(re, angles)]
+    rq = Rotation.from_euler('xyz', re, degrees=True)
+
+    client.send_cartesian_trajectory([0,0,0], 3, True, rq.as_quat())
+
+# kineme: nod "head" (end effector)
+# doesn't work if we are near a singularity, I think
+# intent: ?
+# def nod(self):
+#     # check orientation so we always start nodding "up" first
+#     sign = 1
+#     if (joints_pos[4] <= math.pi/4):
+#         sign *= -1
+
+#     # TODO: check for singularities or something
+
+#     self.send_joint_trajectory([0, 0, 0, 0, sign * math.pi/6, 0], 0.5, True)
+#     self.send_joint_trajectory([0, 0, 0, 0, -sign * math.pi/3, 0], 0.5, True)
+#     self.send_joint_trajectory([0, 0, 0, 0, sign * math.pi/6, 0], 0.5, True)
+
+# kineme: rotate end effector 90 degrees and back
+# intent: grab nearest?
+def grab(client):
+    client.send_joint_trajectory([0, 0, 0, 0, 0, math.pi/2], 0.5, True)
+    client.send_joint_trajectory([0, 0, 0, 0, 0, -math.pi/2], 0.5, True)
+
+def move(client, target):
+    client.send_cartesian_trajectory(target, 2, True)
+
+def old_nod(client):
+    # check orientation so we always start nodding "up" first
+    sign = 1
+    
+    if (joints_pos[4] <= math.pi/4):
+        sign *= -1
+
+    # TODO: check for singularities or something
+    
+    client.send_joint_trajectory([0, 0, 0, 0, sign * math.pi/6, 0], 0.5, True)
+    client.send_joint_trajectory([0, 0, 0, 0, -sign * math.pi/3, 0], 0.5, True)
+    client.send_joint_trajectory([0, 0, 0, 0, sign * math.pi/6, 0], 0.5, True)
+
+def nod(client):
+     # check orientation so we always start nodding "up" first
+    sign = 1
+
+    if (joints_pos[4] <= math.pi/4):
+        sign *= -1
+
+    
+    # TODO: check for singularities or something
+
+    # align wrist_3, gives more natural nodding (TODO: do we need sign?)
+    set_w3 = math.pi
+
+    #client.set_joint(3, math.pi/2, 0.5)
+    #client.set_joint(5, math.pi/2, 0.5)
+
+    targets = [[0, 0, 0, 0, sign * math.pi/6, 0], [0, 0, 0, 0, -sign * math.pi/3, 0], [0, 0, 0, 0, sign * math.pi/6, 0]]
+    
+    client.send_joint_trajectory_list(targets, [0.5, 1, 1.5, 2], True)
+
+### KINEME CLASS
+# possible TODO: variable args? this seems ok though
+class Kineme:
+    def __init__(self, client, name, f, args = None):
+        self.client = client
+        self.name = name
+        # if (args):
+        #     self.execute = execute(client, args)
+        # else:
+        self.f = f
+        self.args = args
+
+    def call(self):
+        if (self.args == None):
+            self.f(self.client)
+        else:
+            self.f(self.client, self.args)
+
+    def set_args(self, args):
+        self.args = args
+
+
+if __name__ == "__main__":
+
+    # list of movements (home is an alias for look_at_me)
+    commands = [home, move, rotate, look_at_me, look_away, grab, nod]
+
+    # for 135 degree mounted CARY UR5e
+    get_y_rotation_matrix(mount_angle)
+
+    # client for sending trajectories
+    client = TrajectoryClient()
+
+    # sampling of commands with random arguments
+    send_home = Kineme(client, "move to home position", commands[0])
+    move_x = Kineme(client, "move 0.1m in -x", commands[1], [-0.1,0,0])
+    move_y = Kineme(client, "move 0.1m in y", commands[1], [0,0.1,0])
+    move_z = Kineme(client, "move 0.1m in +z", commands[1], [0,0,0.1])
+    point_at = Kineme(client, "rotates the EE so we can point at something", commands[2], [0,15,30])
+    send_home_flipped = Kineme(client, "move to mirrored home position", commands[4])
+    rotate_gripper = Kineme(client, "rotate gripper 90 degrees and back", commands[5])
+    nod_ee = Kineme(client, "shake end effector up and down", commands[6])
+
+
+    kinemes = [send_home, move_x, move_y, move_z, send_home_flipped, point_at, rotate_gripper, nod_ee]
+    
+    # rospy.sleep(1)
+    # joints_states = joints_pos
+    # print(joints_states)
+
+    #client.execute([nod_ee])
+    client.joint_trajectory_controller = JOINT_TRAJECTORY_CONTROLLERS[0]
+
+    move_around = Kineme(client, "move around", commands[1], [0.2, 0.2, 0.2])
+    rotate_somewhere = Kineme(client, "rotate somewhere", commands[2], [0, 30, 90])
+    
+    plan = [move_around, rotate_somewhere, nod_ee]
+
+    client.execute(plan, True, True)
+
+    # test_list = [ [0.1,0,0,0,0,0], [0,0.1,0,0,0,0], [0,0,0.1,0,0,0], [0,0,0,0.1,0,0], [0,0,0,0,0.1,0], [0,0,0,0,0,0.1]]
+    # client.send_joint_trajectory_list(test_list, [1,2,3,4,5,6], True)
+
+    # print("AFTER")
+    # print_joints_ordered()
+    #client.joint_trajectory_controller = JOINT_TRAJECTORY_CONTROLLERS[3]
+
+
+    #client.execute([kinemes[0], kinemes[1], kinemes[2], kinemes[3], kinemes[4], kinemes[5], kinemes[0], kinemes[6], kinemes[7]])
+
+    ### garbage below ###
+
+    #client.rotate([-30,-30,0])
+    
+    # q1 = np.diag([0, 0, 0, 1])
+    # np.conjugate(q1)
+    # print(q1)
+
+    # q2 = (np.diag([0, -0.9238555791491362, 0, 0.382664956406552]))
+    # print(np.dot(q1, q2))
+
+    #client.home()
+    #tfr = apply_linear_transformation([1,1,1], rotation_matrix)
+    #print(tfr)
+    # r = Rotation.from_euler('xyz', [0, 45, 0], degrees=True)
+    # qr = r.as_quat()
+    # print(qr)
+
+    # client.home()
+    #client.send_cartesian_trajectory([0, 0, 0.1], 1, True)
+    #client.send_cartesian_trajectory([0, 0, -0.1], 1, True)
+    #coords = [0, -1, 0]
+
+    #theta_z = math.tan(coords[1] / coords[0])
+    #theta_x = math.tan(coords[2] / coords[1])
+    # theta_z = math.pi/2
+    # theta_x = 0
+
+
+
+    # q = [-0.2688, -0.269777, 0.656, 0.651]
+    # rr = Rotation.from_quat(q)
+    # print(rr.as_euler('xyz', degrees=True))
+    #self.send_cartesian_trajectory([0,0,0], 2, True, qr)
+    #commands = [client.point_at]
+    #args = [[1, 1, 1]]
+    #client.execute(commands)
+    #test = apply_linear_transformation([0,0,1], rotation_matrix)
+    #client.home()
+
+    #client.send_cartesian_trajectory([1,0,1], 2, True)
+    #client.point_at(test)
+
+    #client.look_away()
+    #client.look_at_me()
+
+    #client.gripper.open()
+    #client.gripper.close()
+
+    # gripper.move(255, 255, 255)
+    # gripper.move(0, 255, 255)
+    # gripper.move(255, 255, 255)
+
+    #gripper.move_and_wait_for_pos(255, 255, 255)
+    #gripper.move_and_wait_for_pos(0, 255, 255)
+    #client.look_at_me()
+    #client.nod()
+    #client.look_away()
+    #client.nod()
+
+    #client.nod()
+
+    #gripper.move_and_wait_for_pos(255, 255, 255)
+    #gripper.move_and_wait_for_pos(0, 255, 255)
+
+
+    #client.switch_controller(CARTESIAN_TRAJECTORY_CONTROLLERS[0])
+    #client.switch_controller(JOINT_TRAJECTORY_CONTROLLERS[0])
+
+    #client.send_cartesian_trajectory([0, 0, 0.1], True)
+    #client.send_cartesian_trajectory([0, 0, -0.1], True)
+    #client.send_cartesian_trajectory([0.1, 0, 0.1], True)
+    #client.send_cartesian_trajectory([-0.1, 0, -0.1], True)
+
+
+    #client.send_joint_trajectory([math.pi/2, -math.pi/4, math.pi/2, (-3*math.pi)/4, math.pi/4, 0], False)
+    #client.send_joint_trajectory([0, 0, 0, 0, math.pi, 0], 5, True)
+
+
+    #v1 = np.array([[.205, 0, 0], [0, -0.676, 0], [0, 0, 0.255]])
+    #v2 = np.array([[.660, 0, 0], [0, -0.288, 0], [0, 0, -0.043]])
+    #v1 = np.array([0.255, -0.676, 0.255])
+    #v2 = np.array([0.521, -0.497, -0.043])
+
+
+    #v1 = np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1]])
+
+    # v2 = np.array([0.521, -0.497, -0.043])
+    #v2 = np.array([0.205, -0.676, 0.255])
+
+    # #v2 = np.array([[1, 0, 0], [0, -1, 0], [0, 0, 1]])
+    #transform_matrix = np.linalg.solve(np.transpose(v1), np.transpose(v2))
+    #transform_matrix_inv = np.linalg.inv(transform_matrix)
+
+    #transform_matrix_inv = np.linalg.inv(transform_matrix)
+
+    #v1 = [1, 0, 0]
+    #print(apply_linear_transformation(v1, transform_matrix))
+
+    # #print(transform_matrix)
+    # #print(transform_matrix_inv)
+    # # s = (1 / (math.sqrt(2)))
+    # # t = [2.5415, 0.7352, -0.1686]
+    # #transform_matrix_inv = [0.3935, 1.3602, -5.9302]
+
+    #pose = [0, 0.5, 0]
+    # pose = [0.205, -0.676, 0.255]
+    # #pose = [0.246, -0.35, -0.085]
+    # move = [0.0, 0, 0.2]
+    # move = apply_linear_transformation(move, rotation_matrix)
+    # print(move)
+
+    # pose = [sum(x) for x in zip(pose, move)]
+
+    # print(pose)
+
+    # pose = apply_linear_transformation(pose, transform_matrix)
+    # print(pose)
+    # pose[0] += (0.660 - 0.03535534)
+    # pose[1] += (-0.288 + .676)
+    # pose[2] += (-0.043 + 0.32526912)
+
+
+    # print(pose)
+    # pose[2] = 0.058
+    # print(pose)
+    # pose = apply_linear_transformation(pose, transform_matrix_inv)
+    # print(pose)
+
+    #v1 = apply_linear_transformation(v1, transform_matrix).diagonal()
+    #v1 = apply_linear_transformation(v1, transform_matrix_inv)
+
+    # #z = z + 0.1
+    # v2 = [x,y,z]
+    # print(v2)
+
+    # x,y,z = apply_linear_transformation(v2, transform_matrix_inv)
+    # v2 = [x,y,z]
+
+    # # # 0.181, -0.697, -0.042
+    # print(v2)
+
+    # transform_matrix = np.linalg.inv(transform_matrix)
+    # x,y,z = apply_linear_transformation(v2, transform_matrix)
+    # v2 = [x,y,z]
+    # print(v2)
