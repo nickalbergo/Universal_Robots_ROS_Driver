@@ -674,41 +674,45 @@ class Kineme:
 
 if __name__ == "__main__":
 
+
     # list of movements (home is an alias for look_at_me)
-    commands = [home, move, rotate, look_at_me, look_away, grab, nod]
+    # commands = [home, move, rotate, look_at_me, look_away, grab, nod]
 
-    # for 135 degree mounted CARY UR5e
-    get_y_rotation_matrix(mount_angle)
+    # # for 135 degree mounted CARY UR5e
+    # get_y_rotation_matrix(mount_angle)
 
-    # client for sending trajectories
+    # # client for sending trajectories
     client = TrajectoryClient()
 
-    # sampling of commands with random arguments
-    send_home = Kineme(client, "move to home position", commands[0])
-    move_x = Kineme(client, "move 0.1m in -x", commands[1], [-0.1,0,0])
-    move_y = Kineme(client, "move 0.1m in y", commands[1], [0,0.1,0])
-    move_z = Kineme(client, "move 0.1m in +z", commands[1], [0,0,0.1])
-    point_at = Kineme(client, "rotates the EE so we can point at something", commands[2], [0,15,30])
-    send_home_flipped = Kineme(client, "move to mirrored home position", commands[4])
-    rotate_gripper = Kineme(client, "rotate gripper 90 degrees and back", commands[5])
-    nod_ee = Kineme(client, "shake end effector up and down", commands[6])
+    test_move = Kineme(client, "eh", nod)
+    client.execute([test_move], False, False)
+
+    # # sampling of commands with random arguments
+    # send_home = Kineme(client, "move to home position", commands[0])
+    # move_x = Kineme(client, "move 0.1m in -x", commands[1], [-0.1,0,0])
+    # move_y = Kineme(client, "move 0.1m in y", commands[1], [0,0.1,0])
+    # move_z = Kineme(client, "move 0.1m in +z", commands[1], [0,0,0.1])
+    # point_at = Kineme(client, "rotates the EE so we can point at something", commands[2], [0,15,30])
+    # send_home_flipped = Kineme(client, "move to mirrored home position", commands[4])
+    # rotate_gripper = Kineme(client, "rotate gripper 90 degrees and back", commands[5])
+    # nod_ee = Kineme(client, "shake end effector up and down", commands[6])
 
 
-    kinemes = [send_home, move_x, move_y, move_z, send_home_flipped, point_at, rotate_gripper, nod_ee]
+    # kinemes = [send_home, move_x, move_y, move_z, send_home_flipped, point_at, rotate_gripper, nod_ee]
     
-    # rospy.sleep(1)
-    # joints_states = joints_pos
-    # print(joints_states)
+    # # rospy.sleep(1)
+    # # joints_states = joints_pos
+    # # print(joints_states)
 
-    #client.execute([nod_ee])
-    client.joint_trajectory_controller = JOINT_TRAJECTORY_CONTROLLERS[0]
+    # #client.execute([nod_ee])
+    # client.joint_trajectory_controller = JOINT_TRAJECTORY_CONTROLLERS[0]
 
-    move_around = Kineme(client, "move around", commands[1], [0.2, 0.2, 0.2])
-    rotate_somewhere = Kineme(client, "rotate somewhere", commands[2], [0, 30, 90])
+    # move_around = Kineme(client, "move around", commands[1], [0.2, 0.2, 0.2])
+    # rotate_somewhere = Kineme(client, "rotate somewhere", commands[2], [0, 30, 90])
     
-    plan = [move_around, rotate_somewhere, nod_ee]
+    # plan = [move_around]
 
-    client.execute(plan, True, True)
+    # client.execute(plan, True, True)
 
     # test_list = [ [0.1,0,0,0,0,0], [0,0.1,0,0,0,0], [0,0,0.1,0,0,0], [0,0,0,0.1,0,0], [0,0,0,0,0.1,0], [0,0,0,0,0,0.1]]
     # client.send_joint_trajectory_list(test_list, [1,2,3,4,5,6], True)

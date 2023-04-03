@@ -1,34 +1,3 @@
-
-Skip to content
-Pull requests
-Issues
-Codespaces
-Marketplace
-Explore
-@nickalbergo
-nickalbergo /
-phd
-Private
-
-Fork your own copy of nickalbergo/phd
-
-Code
-Issues
-Pull requests
-Actions
-Projects
-Security
-Insights
-
-    Settings
-
-phd/ur_robot_driver/scripts/robotiq_gripper.py /
-@nickalbergo
-nickalbergo initial commit
-Latest commit 450c54c Dec 9, 2022
-History
-1 contributor
-317 lines (265 sloc) 13.6 KB
 #!/usr/bin/env python
 
 """Module to control Robotiq's grippers - tested with HAND-E"""
@@ -339,20 +308,3 @@ class RobotiqGripper:
     def pinch(self):
         self.open()
         self.close()
-Footer
-© 2023 GitHub, Inc.
-Footer navigation
-
-    Terms
-    Privacy
-    Security
-    Status
-    Docs
-    Contact GitHub
-    Pricing
-    API
-    Training
-    Blog
-    About
-
-phd/robotiq_gripper.py at master · nickalbergo/phd
